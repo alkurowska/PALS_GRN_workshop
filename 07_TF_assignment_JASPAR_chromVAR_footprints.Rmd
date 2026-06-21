@@ -342,6 +342,11 @@ write.table(
 ```
 
 ```{r plot-tf-summary}
+png(
+  filename = file.path(results_dir, "tf_assignment_summary.png"),
+  width = 1200,
+  height = 1200, res = 300
+)
 tf_summary |>
   slice_head(n = 30) |>
   ggplot(aes(x = reorder(TF, n_OCRs), y = n_OCRs)) +
@@ -353,6 +358,7 @@ tf_summary |>
     y = "Number of footprint-supported OCRs",
     title = "Top TFs by number of assigned OCRs"
   )
+dev.off()
 ```
 
 # Prepare chromVAR input
