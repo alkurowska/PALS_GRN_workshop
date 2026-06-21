@@ -12,8 +12,6 @@ This workshop introduces a complete computational workflow for reconstructing ge
 
 The workflow follows the analytical framework developed for the reconstruction of regulatory programs during human B-cell differentiation and can be readily adapted to other biological systems.
 
-To ensure that all participants can complete the workflow within the workshop timeframe, computationally intensive analyses such as transcription factor footprinting are provided as precomputed results. The workshop focuses on the biological interpretation and integration of these data layers to reconstruct regulatory networks.
-
 ---
 
 # Study Background
@@ -21,8 +19,6 @@ To ensure that all participants can complete the workflow within the workshop ti
 The analytical workflow presented here follows the strategy described in:
 
 Planell N. et al. *Uncovering the regulatory landscape of early human B cell lymphopoiesis and its implications in the pathogenesis of B-ALL*. Science Advances. 2025;11:eadw3110.
-
-The workshop provides a simplified but biologically faithful implementation of the original pipeline and illustrates how multiple layers of epigenomic and transcriptomic information can be integrated to identify candidate cis-regulatory elements, infer transcription factor activity, and reconstruct cell-type-specific gene regulatory networks.
 
 ---
 
@@ -39,8 +35,6 @@ By the end of the workshop participants will be able to:
 * Incorporate transcription factor footprinting information.
 * Build TF–OCR–gene regulatory networks.
 * Generate cell-type-specific GRNs.
-* Analyze GRN topology using graph theory approaches.
-
 ---
 
 # Required Software
@@ -55,8 +49,6 @@ rtracklayer
 reshape2
 igraph
 ggplot2
-ComplexHeatmap
-circlize
 chromVAR
 motifmatchr
 JASPAR2022
@@ -110,7 +102,3 @@ Network topology analysis
 Master regulator discovery
 ```
 ---
-
-# References
-
-Núria Planell et al., Uncovering the regulatory landscape of early human B cell lymphopoiesis and its implications in the pathogenesis of B-ALL. Sci. Adv. 11, eadw3110 (2025). doi:10.1126/sciadv.adw3110

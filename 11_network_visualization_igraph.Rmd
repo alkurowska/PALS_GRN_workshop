@@ -121,9 +121,8 @@ dev.off()
 ```{r tf-centered-network, fig.width=8, fig.height=8}
 # PAX5 is a well-known TF in B-cell development. Let's plot its ego network in the global GRN.
 # ensembl ID: ENSG00000196092
+target_tf <- "PAX5"
 
-target_tf <- "ENSG00000196092" # PAX5
-target_tf_name <- "PAX5"
 if (target_tf %in% V(net)$name) {
 
   tf_neighbors <- ego(
@@ -137,7 +136,7 @@ if (target_tf %in% V(net)$name) {
     net,
     vids = tf_neighbors
   )
-  pdf(file.path("results",paste0("example_", target_tf_name, "_grn_plot.pdf")), width = 10, height = 10)
+  pdf(file.path("results",paste0("example_", target_tf, "_grn_plot.pdf")), width = 10, height = 10)
   plot(
     tf_graph,
     layout = layout_with_fr(tf_graph),
