@@ -1,0 +1,687 @@
+---
+title: "07 - TF Assignment with JASPAR, chromVAR and Precomputed Footprints"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(SummarizedExperiment)
+  library(chromVAR)
+  library(motifmatchr)
+  library(TFBSTools)
+  library(JASPAR2022)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(Matrix)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggplot2)
+})
+```
+
+# Goal
+
+Assign transcription factors to candidate OCRs using:
+
+1. JASPAR motif evidence.
+2. Precomputed footprint evidence.
+3. chromVAR TF motif accessibility deviations.
+
+This chapter creates the downstream GRN input:
+
+```text
+results/ocr_tf_matrix.txt
+```
+
+# Workflow
+
+```text
+Candidate CREs / OCRs
+        ↓
+OCR genomic ranges
+        ↓
+JASPAR motif matching
+        ↓
+Precomputed footprint overlap
+        ↓
+Footprint-supported OCR–TF matrix
+        ↓
+chromVAR motif deviation scores
+        ↓
+TF accessibility profiles
+        ↓
+GRN input
+```
+
+# Important note about HINT and Wellington
+
+Footprinting is **not run during the workshop**.
+
+The original workflow used HINT-ATAC and Wellington on an HPC cluster. The outputs were unified and summarized into consensus footprint BED files per cell type.
+
+During the workshop we only load the precomputed BED files. For a full pipeline check https://github.com/TranslationalBioinformaticsUnit/bcell/tree/main
+
+```{r hpc-footprinting-note, eval=FALSE}
+# HPC-only preprocessing example.
+# Do not run during the workshop.
+
+# HINT-ATAC:
+# rgt-hint footprinting \
+#   --atac-seq \
+#   --paired-end \
+#   --organism=hg38 \
+#   --output-prefix=sample_footprint \
+#   --output-location=footprints/hint \
+#   sample.bam \
+#   sample_peaks.bed
+
+# Wellington:
+# wellington_footprints.py sample_peaks.bed sample.bam footprints/wellington
+```
+
+# Define paths
+
+```{r paths}
+data_dir <- if (dir.exists("data")) "data" else "."
+results_dir <- "results"
+
+cat("Using data directory:", normalizePath(data_dir), "\n")
+cat("Using results directory:", normalizePath(results_dir), "\n")
+```
+
+# Load candidate CREs
+
+```{r load-candidate-cres}
+candidate_CREs <- readRDS(file.path(results_dir, "candidate_CREs.rds"))
+
+head(candidate_CREs)
+dim(candidate_CREs)
+```
+
+# Build OCR GRanges
+
+Candidate CREs contain OCR IDs in the format `chr_start_end`.
+
+```{r build-ocr-granges}
+peak_ids <- unique(candidate_CREs$peak)
+peak_split <- strsplit(peak_ids, "_")
+
+ocr_df <- data.frame(
+  chr = vapply(peak_split, `[`, character(1), 1),
+  start = as.numeric(vapply(peak_split, `[`, character(1), 2)),
+  end = as.numeric(vapply(peak_split, `[`, character(1), 3)),
+  peak = peak_ids
+)
+
+ocr_df <- ocr_df[!is.na(ocr_df$start) & !is.na(ocr_df$end), ]
+
+ocr_gr <- makeGRangesFromDataFrame(
+  ocr_df,
+  keep.extra.columns = TRUE
+)
+
+names(ocr_gr) <- ocr_df$peak
+ocr_gr
+```
+
+# Load precomputed footprint BED files
+
+```{r load-footprints}
+footprint_files <- list.files(
+  data_dir,
+  pattern = "consensus_unified_footprint.*\\.bed$|footprint.*\\.bed$",
+  full.names = TRUE
+)
+
+footprint_files <- footprint_files[
+  !grepl("all_cell", basename(footprint_files), ignore.case = TRUE)
+]
+
+footprint_files
+```
+
+```{r import-footprints}
+footprints <- lapply(footprint_files, import)
+
+names(footprints) <- basename(footprint_files)
+names(footprints) <- gsub("_consensus_unified_footprint.*", "", names(footprints))
+names(footprints) <- gsub("\\.bed$", "", names(footprints))
+names(footprints) <- gsub("\\(.*\\)", "", names(footprints))
+
+names(footprints)
+lengths(footprints)
+```
+
+# Create unified footprint set
+
+```{r unified-footprints}
+footprints2 <- Map(function(gr, nm) {
+  gr$celltype <- nm
+  gr
+}, footprints, names(footprints))
+
+all_footprints <- reduce(do.call(c, unname(footprints2)))
+
+all_footprints <- all_footprints[width(all_footprints) >= 6]
+all_footprints
+```
+
+# Identify OCRs overlapping footprints
+
+```{r ocr-footprint-overlap}
+ocr_fp_hits <- findOverlaps(
+  ocr_gr,
+  all_footprints,
+  type = "any",
+  minoverlap = 1
+)
+
+ocr_has_footprint <- names(ocr_gr) %in% names(ocr_gr)[unique(queryHits(ocr_fp_hits))]
+
+table(ocr_has_footprint)
+```
+
+# JASPAR motif collection
+
+```{r jaspar-motifs}
+opts <- list(
+  species = 9606,
+  collection = "CORE",
+  all_versions = FALSE
+)
+
+pfm <- getMatrixSet(
+  JASPAR2022,
+  opts
+)
+
+length(pfm)
+pfm[1:3]
+```
+
+# Prepare genome sequence information
+
+```{r prepare-genome}
+genome <- BSgenome.Hsapiens.UCSC.hg38
+standard_chr <- paste0("chr", c(1:22, "X", "Y"))
+
+ocr_gr <- keepSeqlevels(
+  ocr_gr,
+  intersect(seqlevels(ocr_gr), standard_chr),
+  pruning.mode = "coarse"
+)
+
+seqlevelsStyle(ocr_gr) <- "UCSC"
+ocr_gr
+```
+
+# Match JASPAR motifs to OCRs
+
+```{r match-jaspar-motifs}
+motif_ix <- matchMotifs(
+  pwms = pfm,
+  subject = ocr_gr,
+  genome = genome,
+  out = "matches"
+)
+
+motif_matrix <- motifMatches(motif_ix)
+
+dim(motif_matrix)
+motif_matrix[1:5, 1:5]
+```
+
+# Convert motifs to TF names
+
+```{r motif-to-tf-names}
+motif_names <- name(pfm)
+
+tf_names <- motif_names
+tf_names <- gsub("::", "_", tf_names)
+tf_names <- gsub("\\(var\\.2\\)", "", tf_names)
+tf_names <- gsub("\\(var\\.3\\)", "", tf_names)
+tf_names <- gsub("\\s+", "", tf_names)
+
+colnames(motif_matrix) <- tf_names
+
+motif_matrix_binary <- as.matrix(motif_matrix)
+storage.mode(motif_matrix_binary) <- "numeric"
+rownames(motif_matrix_binary) <- names(ocr_gr)
+
+dim(motif_matrix_binary)
+```
+
+# Keep only footprint-supported motif calls
+
+The motif matrix tells us where a TF could bind based on sequence. The footprint overlap tells us which OCRs show local evidence of TF occupancy.
+
+```{r footprint-supported-motif-matrix}
+ocr_has_footprint <- ocr_has_footprint[match(rownames(motif_matrix_binary), names(ocr_gr))]
+
+ocr_tf_matrix <- motif_matrix_binary
+ocr_tf_matrix[!ocr_has_footprint, ] <- 0
+
+ocr_tf_matrix <- ocr_tf_matrix[, colSums(ocr_tf_matrix) > 0, drop = FALSE]
+ocr_tf_matrix <- ocr_tf_matrix[rowSums(ocr_tf_matrix) > 0, , drop = FALSE]
+
+dim(ocr_tf_matrix)
+```
+
+# Collapse duplicated TF columns
+
+```{r collapse-duplicated-tfs}
+if (any(duplicated(colnames(ocr_tf_matrix)))) {
+
+  tf_unique <- unique(colnames(ocr_tf_matrix))
+
+  ocr_tf_collapsed <- matrix(
+    0,
+    nrow = nrow(ocr_tf_matrix),
+    ncol = length(tf_unique),
+    dimnames = list(
+      rownames(ocr_tf_matrix),
+      tf_unique
+    )
+  )
+
+  for (tf in tf_unique) {
+    idx <- which(colnames(ocr_tf_matrix) == tf)
+    ocr_tf_collapsed[, tf] <- as.numeric(rowSums(ocr_tf_matrix[, idx, drop = FALSE]) > 0)
+  }
+
+  ocr_tf_matrix <- ocr_tf_collapsed
+}
+
+dim(ocr_tf_matrix)
+```
+
+# Save OCR–TF matrix
+
+```{r save-ocr-tf-matrix}
+write.table(
+  ocr_tf_matrix,
+  file.path(results_dir, "ocr_tf_matrix.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = TRUE,
+  col.names = NA
+)
+
+saveRDS(
+  ocr_tf_matrix,
+  file.path(results_dir, "ocr_tf_matrix.rds")
+)
+
+ocr_tf_matrix[1:5, 1:min(5, ncol(ocr_tf_matrix))]
+```
+
+# Summary of TF assignments
+
+```{r tf-assignment-summary}
+tf_summary <- data.frame(
+  TF = colnames(ocr_tf_matrix),
+  n_OCRs = colSums(ocr_tf_matrix)
+) |>
+  arrange(desc(n_OCRs))
+
+head(tf_summary, 20)
+
+write.table(
+  tf_summary,
+  file.path(results_dir, "ocr_tf_assignment_summary.txt"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+```
+
+```{r plot-tf-summary}
+tf_summary |>
+  slice_head(n = 30) |>
+  ggplot(aes(x = reorder(TF, n_OCRs), y = n_OCRs)) +
+  geom_col() +
+  coord_flip() +
+  theme_classic() +
+  labs(
+    x = "TF",
+    y = "Number of footprint-supported OCRs",
+    title = "Top TFs by number of assigned OCRs"
+  )
+```
+
+# Prepare chromVAR input
+
+chromVAR requires **raw or integer-like ATAC counts**, not log-normalized accessibility values.
+
+```{r load-atac-counts}
+counts_rds <- file.path(data_dir, "atac_raw_data.rds")
+
+if (file.exists(counts_rds)) {
+
+  atac_counts <- readRDS(counts_rds)
+
+} else if (file.exists(counts_txt)) {
+
+  atac_counts <- as.matrix(
+    read.delim(
+      counts_txt,
+      check.names = FALSE,
+      row.names = 1
+    )
+  )
+
+} else {
+
+  atac_counts <- NULL
+  message("No raw ATAC count matrix found. chromVAR section will be skipped.")
+}
+
+if (!is.null(atac_counts)) {
+  dim(atac_counts)
+}
+```
+
+# Load ATAC metadata for chromVAR
+
+```{r load-atac-metadata}
+metadata_rds <- file.path(data_dir, "atac_metadata.rds")
+
+if (file.exists(metadata_rds)) {
+
+  atac_metadata <- readRDS(metadata_rds)
+
+} else if (file.exists(metadata_txt)) {
+
+  atac_metadata <- read.table(
+    metadata_txt,
+    sep = "\t",
+    header = TRUE,
+    check.names = FALSE
+  )
+
+} else {
+
+  atac_metadata <- NULL
+  message("No ATAC metadata found. chromVAR section will be skipped.")
+}
+
+if (!is.null(atac_metadata)) {
+  head(atac_metadata)
+}
+```
+
+# Match counts, peaks and metadata
+
+```{r chromvar-matching}
+run_chromvar <- !is.null(atac_counts) && !is.null(atac_metadata)
+
+if (run_chromvar) {
+
+  if (!all(colnames(atac_counts) %in% rownames(atac_metadata))) {
+
+    possible_id_cols <- c("SampleID", "Alias", "sample", "sample_id", "Sample", "ID")
+
+    id_col <- possible_id_cols[
+      possible_id_cols %in% colnames(atac_metadata)
+    ][1]
+
+    if (!is.na(id_col)) {
+      rownames(atac_metadata) <- atac_metadata[[id_col]]
+    }
+  }
+
+  atac_metadata <- atac_metadata[
+    match(colnames(atac_counts), rownames(atac_metadata)),
+    ,
+    drop = FALSE
+  ]
+
+  run_chromvar <- all(rownames(atac_metadata) == colnames(atac_counts))
+
+  if (!run_chromvar) {
+    message("Could not match ATAC metadata to count matrix. chromVAR will be skipped.")
+  }
+}
+```
+
+```{r chromvar-peak-matching}
+if (run_chromvar) {
+
+  common_peaks <- intersect(rownames(atac_counts), names(ocr_gr))
+  common_peaks <- intersect(common_peaks, rownames(ocr_tf_matrix))
+
+  atac_counts_cv <- atac_counts[common_peaks, , drop = FALSE]
+  ocr_gr_cv <- ocr_gr[common_peaks]
+  ocr_tf_matrix_cv <- ocr_tf_matrix[common_peaks, , drop = FALSE]
+
+  dim(atac_counts_cv)
+  dim(ocr_tf_matrix_cv)
+}
+```
+
+# Run chromVAR
+
+```{r run-chromvar}
+
+fragment_counts <- SummarizedExperiment(
+    assays = list(counts = atac_counts_cv),
+    rowRanges = ocr_gr_cv,
+    colData = atac_metadata
+  )
+
+  fragment_counts <- addGCBias(
+    fragment_counts,
+    genome = genome
+  )
+
+keep <- base::rowSums(counts(fragment_counts)) > 0
+
+fragment_counts_filtered <- fragment_counts[keep, ]
+
+  ocr_tf_matrix_cv <- ocr_tf_matrix_cv[
+    rownames(fragment_counts_filtered),
+    ,
+    drop = FALSE
+  ]
+
+  annotations <- getAnnotations(
+    ocr_tf_matrix_cv,
+    rowRanges = rowRanges(fragment_counts_filtered)
+  )
+
+  dev <- computeDeviations(
+    object = fragment_counts_filtered,
+    annotations = annotations
+  )
+
+  TF_deviations <- deviations(dev)
+  TF_scores <- deviationScores(dev)
+  TF_variability <- computeVariability(dev)
+
+  saveRDS(
+    dev,
+    file.path(results_dir, "chromVAR_TF_deviations_object.rds")
+  )
+
+  write.table(
+    TF_deviations,
+    file.path(results_dir, "TF_TFBS_deviations.txt"),
+    sep = "\t",
+    quote = FALSE
+  )
+
+  write.table(
+    TF_scores,
+    file.path(results_dir, "TF_TFBS_score.txt"),
+    sep = "\t",
+    quote = FALSE
+  )
+
+  write.table(
+    TF_variability,
+    file.path(results_dir, "TF_TFBS_variability.txt"),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE
+  )
+
+  head(TF_variability)
+
+```
+
+# chromVAR sample correlation
+
+```{r chromvar-sample-correlation}
+sample_cor <- getSampleCorrelation(dev)
+
+  saveRDS(
+    sample_cor,
+    file.path(results_dir, "chromVAR_sample_correlation.rds")
+  )
+
+Heatmap(
+    sample_cor,
+    show_row_names = FALSE,
+    show_column_names = FALSE,
+    name = "rho",
+    column_title = "chromVAR sample correlation"
+  )
+
+```
+
+# chromVAR TF score heatmap
+
+```{r chromvar-tf-heatmap}
+top_variable_tfs <- TF_variability |>
+    arrange(desc(variability)) |>
+    slice_head(n = min(50, nrow(TF_variability))) |>
+    pull(name)
+
+  TF_scores_top <- TF_scores[
+    top_variable_tfs,
+    ,
+    drop = FALSE
+  ]
+
+Heatmap(
+    TF_scores_top,
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    name = "Z-score",
+    column_title = "Top variable TF motif accessibility scores"
+  )
+```
+
+# Optional: correlate chromVAR TF scores with RNA expression
+
+```{r tfbs-rna-correlation}
+rna_file <- file.path(data_dir, "rna_norm_data.rds")
+rna_anno_file <- file.path(data_dir, "rna_gene_annotation.rds")
+
+if (
+  run_chromvar &&
+  file.exists(rna_file) &&
+  file.exists(rna_anno_file)
+) {
+
+  rna <- readRDS(rna_file)
+  rna_anno <- readRDS(rna_anno_file)
+
+  ids_atac_rna <- intersect(
+    colnames(TF_scores),
+    colnames(rna)
+  )
+
+  if (length(ids_atac_rna) > 2) {
+
+    rna2 <- as.matrix(rna[, ids_atac_rna, drop = FALSE])
+    TF_scores2 <- as.matrix(TF_scores[, ids_atac_rna, drop = FALSE])
+
+    if ("hgnc_symbol" %in% colnames(rna_anno)) {
+      rna_symbols <- rna_anno$hgnc_symbol[
+        match(rownames(rna2), rna_anno$ensembl_gene_id)
+      ]
+
+      keep <- !is.na(rna_symbols) & rna_symbols != ""
+      rna2 <- rna2[keep, , drop = FALSE]
+      rownames(rna2) <- rna_symbols[keep]
+    }
+
+    common_tfs <- intersect(
+      rownames(TF_scores2),
+      rownames(rna2)
+    )
+
+    tfbs_rna_correlation <- lapply(common_tfs, function(tf) {
+
+      cc <- cor.test(
+        as.numeric(TF_scores2[tf, ]),
+        as.numeric(rna2[tf, ]),
+        method = "spearman"
+      )
+
+      data.frame(
+        TF = tf,
+        spearman_pval = cc$p.value,
+        spearman_rho = as.numeric(cc$estimate)
+      )
+    }) |>
+      bind_rows()
+
+    tfbs_rna_correlation$spearman_adj_pval <- p.adjust(
+      tfbs_rna_correlation$spearman_pval,
+      method = "bonferroni"
+    )
+
+    write.table(
+      tfbs_rna_correlation,
+      file.path(results_dir, "TFBS_RNA_correlation.txt"),
+      sep = "\t",
+      quote = FALSE,
+      row.names = FALSE
+    )
+
+    tfbs_rna_correlation |>
+      arrange(spearman_adj_pval) |>
+      head(20)
+  }
+}
+```
+
+# Output files
+
+This chapter creates:
+
+```text
+results/ocr_tf_matrix.txt
+results/ocr_tf_matrix.rds
+results/ocr_tf_assignment_summary.txt
+results/chromVAR_TF_deviations_object.rds
+results/TF_TFBS_deviations.txt
+results/TF_TFBS_score.txt
+results/TF_TFBS_variability.txt
+results/chromVAR_sample_correlation.rds
+results/TFBS_RNA_correlation.txt
+```
+
+# Notes for downstream GRN reconstruction
+
+The next chapter expects:
+
+```text
+results/ocr_tf_matrix.txt
+```
+
+This matrix has:
+
+- rows = OCRs
+- columns = TFs
+- values = binary TF assignment
+
+Only OCRs with both motif evidence and footprint support are retained.

@@ -1,0 +1,157 @@
+---
+title: "04 - Promoter OCR-Gene Correlations"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(igraph)
+  library(ggplot2)
+})
+```
+
+
+# Goal
+
+Link promoter OCRs to genes using paired RNA and ATAC samples.
+
+
+# Load input data
+
+```{r load-inputs}
+atac <- readRDS(file.path("data", "atac_norm_data.rds"))
+atac_metadata <- readRDS(file.path("data", "atac_metadata.rds"))
+
+if (file.exists(file.path("data", "atac_OCR_annotation_extended_histone.rds"))) {
+  atac_anno <- readRDS(file.path("data", "atac_OCR_annotation_extended_histone.rds"))
+} else {
+  atac_anno <- readRDS(file.path("data", "atac_OCR_annotation.rds"))
+}
+
+rna <- readRDS(file.path("data", "rna_norm_data.rds"))
+rna_metadata <- readRDS(file.path("data", "rna_metadata.rds"))
+rna_anno <- readRDS(file.path("data", "rna_gene_annotation.rds"))
+
+common_ids <- readRDS(file.path("data", "rna_atac_paired_samples.rds"))
+```
+
+# Prepare paired matrices
+
+```{r paired-matrices}
+rna_common <- as.matrix(rna[, common_ids])
+atac_common <- as.matrix(atac[, common_ids])
+
+rna_anno <- rna_anno[rownames(rna_common), ]
+atac_anno <- atac_anno[rownames(atac_common), ]
+```
+
+# Select promoter OCRs
+
+```{r promoter-ocrs}
+atac_anno_promoter <- atac_anno[
+  atac_anno$annotation_simplified == "Promoter",
+]
+
+# remove Promoters without ENSEMBL annotation
+atac_anno_promoter <- atac_anno_promoter[!is.na(atac_anno_promoter$ENSEMBL),]
+nrow(atac_anno_promoter)
+
+atac_promoter <- atac_common[rownames(atac_anno_promoter), ]
+
+```
+
+# Correlate promoter OCRs with their annotated gene
+
+```{r promoter-correlations}
+peak_gene_association_promoter <- list()
+
+for (i in seq_len(nrow(rna_common))) {
+  gene_id <- rownames(rna_common)[i]
+
+  sel <- rownames(atac_anno_promoter)[
+    atac_anno_promoter$ENSEMBL == gene_id
+  ]
+
+  if (length(sel) != 0) {
+    cor_output <- lapply(sel, function(peak_id) {
+      cc <- cor.test(rna_common[i, ], atac_promoter[peak_id, ])
+      cc2 <- cor.test(rna_common[i, ], atac_promoter[peak_id, ], method = "spearman")
+
+      data.frame(
+        peak = peak_id,
+        pearson_pval = cc$p.value,
+        pearson_rho = as.numeric(cc$estimate),
+        spearman_pval = cc2$p.value,
+        spearman_rho = as.numeric(cc2$estimate)
+      )
+    }) |>
+      bind_rows()
+  } else {
+    cor_output <- NA
+  }
+
+  peak_gene_association_promoter[[i]] <- cor_output
+}
+
+names(peak_gene_association_promoter) <- rownames(rna_common)
+```
+
+# Bonferroni correction
+
+```{r promoter-adjustment}
+n_contrasts_promoters <- unlist(lapply(
+  peak_gene_association_promoter,
+  function(x) {
+    if (is.data.frame(x)) return(nrow(x))
+    if (is.na(x)) return(0)
+  }
+))
+
+adj_peak_gene_association_promoter <- lapply(
+  peak_gene_association_promoter,
+  function(x) {
+    if (is.data.frame(x)) {
+      x$pearson_adj.pval <- p.adjust(
+        x$pearson_pval,
+        method = "bonferroni",
+        n = sum(n_contrasts_promoters)
+      )
+
+      x$spearman_adj.pval <- p.adjust(
+        x$spearman_pval,
+        method = "bonferroni",
+        n = sum(n_contrasts_promoters)
+      )
+    }
+
+    x
+  }
+)
+```
+
+# Save promoter OCR-gene links
+
+```{r save-promoter-links}
+promoter_ocr_gene_corr <- bind_rows(
+  adj_peak_gene_association_promoter[
+    unlist(lapply(adj_peak_gene_association_promoter, is.data.frame))
+  ],
+  .id = "gene"
+)
+
+saveRDS(
+  promoter_ocr_gene_corr,
+  file.path("results", "promoter_ocr_gene_corr.rds")
+)
+
+head(promoter_ocr_gene_corr)
+dim(promoter_ocr_gene_corr)
+```

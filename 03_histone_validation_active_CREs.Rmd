@@ -1,0 +1,94 @@
+---
+title: "03 - Histone Validation of Active CREs"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(igraph)
+  library(ggplot2)
+})
+```
+
+
+# Goal
+
+Validate OCRs with histone marks.
+
+Definitions:
+
+```text
+Active promoter = H3K4me3 + H3K27ac
+Active enhancer = H3K4me1 + H3K27ac
+```
+
+# Load OCR annotation
+
+```{r load-ocr}
+ocr_anno <- readRDS(file.path("data", "atac_OCR_annotation.rds"))
+
+ocr_gr <- makeGRangesFromDataFrame(
+  ocr_anno,
+  keep.extra.columns = TRUE
+)
+
+names(ocr_gr) <- rownames(ocr_anno)
+```
+
+# Load histone BED files
+
+```{r load-histone-beds}
+h3k4me1 <- import(file.path("data", "H3K4me1_regions.bed"))
+h3k4me3 <- import(file.path("data", "H3K4me3_regions.bed"))
+h3k27ac <- import(file.path("data", "H3K27ac_regions.bed"))
+```
+
+# Compute overlaps
+
+```{r histone-overlap}
+hits_h3k4me1 <- findOverlaps(ocr_gr, h3k4me1, minoverlap = 6)
+hits_h3k4me3 <- findOverlaps(ocr_gr, h3k4me3, minoverlap = 6)
+hits_h3k27ac <- findOverlaps(ocr_gr, h3k27ac, minoverlap = 6)
+
+ocr_anno$h3k4me1 <- "no"
+ocr_anno$h3k4me3 <- "no"
+ocr_anno$h3k27ac <- "no"
+
+ocr_anno$h3k4me1[unique(queryHits(hits_h3k4me1))] <- "yes"
+ocr_anno$h3k4me3[unique(queryHits(hits_h3k4me3))] <- "yes"
+ocr_anno$h3k27ac[unique(queryHits(hits_h3k27ac))] <- "yes"
+```
+
+# Define active promoters and enhancers
+
+```{r active-cre-definitions}
+ocr_anno$active_promoter_histone_mark <- "no"
+ocr_anno$active_promoter_histone_mark[
+  ocr_anno$h3k4me3 == "yes" & ocr_anno$h3k27ac == "yes"
+] <- "yes"
+
+ocr_anno$active_enhancer_histone_mark <- "no"
+ocr_anno$active_enhancer_histone_mark[
+  ocr_anno$h3k4me1 == "yes" & ocr_anno$h3k27ac == "yes"
+] <- "yes"
+
+table(ocr_anno$active_promoter_histone_mark)
+table(ocr_anno$active_enhancer_histone_mark)
+```
+
+# Save extended OCR annotation
+
+```{r save-histone-extended}
+saveRDS(
+  ocr_anno,
+  file.path("data", "atac_OCR_annotation_extended_histone.rds")
+)
+```

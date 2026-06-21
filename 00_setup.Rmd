@@ -1,0 +1,116 @@
+---
+title: "00 - Setup"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup-packages, message=FALSE, warning=FALSE}
+
+cran_packages <- c(
+  "tidyverse",
+  "reshape2",
+  "igraph",
+  "ggplot2",
+  "ComplexHeatmap",
+  "circlize",
+  "Matrix"
+)
+
+bioc_packages <- c(
+  "GenomicRanges",
+  "edgeR",
+  "limma",
+  "rtracklayer",
+  "chromVAR",
+  "motifmatchr",
+  "JASPAR2022",
+  "BSgenome.Hsapiens.UCSC.hg38"
+)
+
+install_if_missing <- function(pkg){
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+for(pkg in cran_packages){
+  install_if_missing(pkg)
+}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+for(pkg in bioc_packages){
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)
+  }
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(edgeR)
+  library(limma)
+  library(igraph)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(chromVAR)
+  library(motifmatchr)
+  library(JASPAR2022)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+})
+
+sessionInfo()
+```
+
+# Goal
+
+Prepare the R environment and define standard input/output paths.
+
+```{r paths}
+data_dir <- "data"
+results_dir <- "results"
+
+dir.create(results_dir, showWarnings = FALSE)
+```
+
+# Required input files
+
+```{r expected-files}
+expected_files <- c(
+  "rna_norm_data
+  .rds",
+  "rna_metadata.rds",
+  "rna_gene_annotation.rds",
+  "atac_norm_data.rds",
+  "atac_metadata.rds",
+  "atac_OCR_annotation.rds",
+  "rna_atac_paired_samples.rds"
+)
+
+file.path(data_dir, expected_files)
+```
+
+# Cell types
+
+```{r cell-types}
+cell_type <- c(
+  "HSC",
+  "CLP",
+  "proB",
+  "preB",
+  "ImmatureB",
+  "Transitional_B",
+  "Naive_CD5neg",
+  "Naive_CD5pos"
+)
+
+cell_type
+```

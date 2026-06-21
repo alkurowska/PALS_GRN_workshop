@@ -1,0 +1,257 @@
+---
+title: "01 - Differential Accessibility ATAC-seq"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(edgeR)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(igraph)
+  library(ggplot2)
+  library(limma)
+  library(ComplexHeatmap)
+  library(circlize)
+})
+```
+
+
+# Goal
+
+Identify differentially accessible OCRs and generate ATAC clusters used later in GRN filtering.
+
+# Load ATAC data
+
+```{r load-atac}
+atac <- readRDS(file.path("data", "atac_norm_data.rds"))
+atac_metadata <- readRDS(file.path("data", "atac_metadata.rds"))
+atac_anno <- readRDS(file.path("data", "atac_OCR_annotation.rds"))
+
+dim(atac)
+head(atac_metadata)
+head(atac_anno)
+
+```
+
+
+# Differential accessibility analysis from normalized ATAC data
+
+This workflow starts from the normalized ATAC matrix and tests chromatin accessibility changes across B-cell differentiation transitions.
+
+```{r differential-accessibility-normalized-atac}
+
+# Match metadata to ATAC columns
+atac_metadata <- atac_metadata[match(colnames(atac), rownames(atac_metadata)), ]
+
+stopifnot(all(rownames(atac_metadata) == colnames(atac)))
+
+# Define cell-type order
+atac_metadata$CellType <- factor(
+  atac_metadata$CellType,
+  levels = c(
+    "HSC",
+    "CLP",
+    "proB",
+    "preB",
+    "ImmatureB",
+    "Transitional_B",
+    "Naive_CD5neg",
+    "Naive_CD5pos"
+  )
+)
+
+# Build design matrix
+# If donor information is available, include it as a covariate.
+if ("Donor" %in% colnames(atac_metadata)) {
+  design <- model.matrix(~ 0 + CellType + Donor, data = atac_metadata)
+} else if ("Factor" %in% colnames(atac_metadata)) {
+  design <- model.matrix(~ 0 + CellType + Factor, data = atac_metadata)
+} else {
+  design <- model.matrix(~ 0 + CellType, data = atac_metadata)
+}
+
+colnames(design) <- gsub("CellType", "", colnames(design))
+
+design
+```
+
+# Fit limma model
+
+```{r fit-limma-atac}
+# log transform the matrix
+fit <- lmFit(atac, design)
+```
+
+# Define B-cell differentiation transition contrasts
+
+```{r atac-transition-contrasts}
+contrast_matrix <- makeContrasts(
+  HSC_CLP = CLP - HSC,
+  CLP_ProB = proB - CLP,
+  ProB_PreB = preB - proB,
+  PreB_ImmatureB = ImmatureB - preB,
+  ImmatureB_TransitionalB = Transitional_B - ImmatureB,
+  TransitionalB_NaiveCD5neg = Naive_CD5neg - Transitional_B,
+  TransitionalB_NaiveCD5pos = Naive_CD5pos - Transitional_B,
+  NaiveCD5neg_NaiveCD5pos = Naive_CD5pos - Naive_CD5neg,
+  levels = design
+)
+
+contrast_matrix
+```
+
+# Extract DARs per transition
+
+```{r extract-dars}
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+dar_list <- lapply(colnames(contrast_matrix), function(contrast_name) {
+  res <- topTable(
+    fit2,
+    coef = contrast_name,
+    number = Inf,
+    sort.by = "none",
+    adjust.method = "BH"
+  )
+
+  res$peak <- rownames(res)
+  res$contrast <- contrast_name
+
+  res
+})
+
+names(dar_list) <- colnames(contrast_matrix)
+
+saveRDS(
+  dar_list,
+  file.path("results", "atac_differential_accessibility_all_contrasts.rds")
+)
+
+head(dar_list[[1]])
+```
+
+# Build transition matrices
+
+This reproduces the structure of the original transition-level output:
+
+- `sig_*`: direction of significant accessibility change  
+  - `1` = increased accessibility
+  - `-1` = decreased accessibility
+  - `0` = not significant
+- `p.adj_*`: adjusted p-value
+- `logFC_*`: log fold-change
+
+```{r build-transition-matrices}
+all_padj <- do.call(
+  cbind,
+  lapply(dar_list, function(x) x$adj.P.Val)
+)
+
+all_logFC <- do.call(
+  cbind,
+  lapply(dar_list, function(x) x$logFC)
+)
+
+rownames(all_padj) <- rownames(atac)
+rownames(all_logFC) <- rownames(atac)
+
+colnames(all_padj) <- paste0("p.adj_", names(dar_list))
+colnames(all_logFC) <- paste0("logFC_", names(dar_list))
+
+sig <- matrix(
+  0,
+  nrow = nrow(atac),
+  ncol = length(dar_list),
+  dimnames = list(
+    rownames(atac),
+    paste0("sig_", names(dar_list))
+  )
+)
+
+sig[all_padj < 0.01 & all_logFC > 0] <- 1
+sig[all_padj < 0.01 & all_logFC < 0] <- -1
+
+dea_results <- data.frame(sig, all_padj, all_logFC)
+
+head(dea_results)
+```
+
+# Save differential accessibility results
+
+```{r save-dar-results}
+write.table(
+  dea_results,
+  file.path("results", "dea_transitions.txt"),
+  sep = "\t",
+  quote = FALSE
+)
+
+transition_cols <- grep("^sig_", colnames(sig), value = TRUE)
+
+dea_sig <- sig[
+  apply(sig[, transition_cols, drop = FALSE], 1, function(x) sum(x != 0)) > 0,
+  ,
+  drop = FALSE
+]
+
+write.table(
+  dea_sig,
+  file.path("results", "sig_dea_transitions.txt"),
+  sep = "\t",
+  quote = FALSE
+)
+
+dim(dea_sig)
+```
+
+# Create downstream ATAC cluster object
+
+The downstream GRN workflow uses `cluster_atac$peak` to retain enhancer OCRs that are differentially accessible in at least one main transition.
+
+```{r create-cluster-atac}
+cluster_atac <- data.frame(
+  peak = rownames(dea_sig)
+)
+
+saveRDS(
+  cluster_atac,
+  file.path("results", "atac_dar_clustering.rds")
+)
+
+head(cluster_atac)
+```
+
+# Quick visualization
+
+```{r plot-dar-summary}
+dar_summary <- data.frame(
+  contrast = names(dar_list),
+  n_up = colSums(sig == 1),
+  n_down = colSums(sig == -1)
+)
+
+dar_summary_long <- dar_summary |>
+  pivot_longer(
+    cols = c(n_up, n_down),
+    names_to = "direction",
+    values_to = "n_peaks"
+  )
+
+ggplot(dar_summary_long, aes(x = contrast, y = n_peaks, fill = direction)) +
+  geom_col(position = "dodge") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = "Transition",
+    y = "Number of DARs",
+    fill = "Direction"
+  )
+```

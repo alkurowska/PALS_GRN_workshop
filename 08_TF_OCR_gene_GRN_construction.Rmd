@@ -1,0 +1,276 @@
+---
+title: "08 - TF-OCR-Gene GRN Construction"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(igraph)
+  library(ggplot2)
+})
+```
+
+
+# Goal
+
+Construct candidate TF-OCR-gene interactions.
+
+# Load inputs
+
+```{r load-inputs}
+rna <- readRDS(file.path("data", "rna_norm_data.rds"))
+rna_metadata <- readRDS(file.path("data", "rna_metadata.rds"))
+rna_anno <- readRDS(file.path("data", "rna_gene_annotation.rds"))
+
+atac <- readRDS(file.path("data", "atac_norm_data.rds"))
+atac_metadata <- readRDS(file.path("data", "atac_metadata.rds"))
+
+if (file.exists(file.path("data", "atac_OCR_annotation_extended_histone.rds"))) {
+  atac_anno <- readRDS(file.path("data", "atac_OCR_annotation_extended_histone.rds"))
+} else {
+  atac_anno <- readRDS(file.path("data", "atac_OCR_annotation.rds"))
+}
+
+ocr_gene <- readRDS(file.path("results", "candidate_CREs.rds"))
+
+ocr_tf_matrix <- read.table(
+  file.path("results", "ocr_tf_matrix.txt"),
+  sep = "	",
+  header = TRUE,
+  check.names = FALSE
+)
+
+cluster_rna <- readRDS(file.path("results", "rna_deg_clustering.rds"))
+cluster_atac <- readRDS(file.path("results", "atac_dar_clustering.rds"))
+```
+
+# Filter OCR-TF matrix
+
+```{r filter-ocr-tf}
+sel_ocr <- which(rowSums(ocr_tf_matrix) == 0)
+
+if (length(sel_ocr) > 0) {
+  ocr_tf_matrix <- ocr_tf_matrix[-sel_ocr, ]
+}
+
+target_OCRs <- intersect(
+  rownames(ocr_tf_matrix),
+  unique(ocr_gene$peak)
+)
+
+ocr_tf_matrix2 <- ocr_tf_matrix[target_OCRs, , drop = FALSE]
+ocr_gene2 <- ocr_gene[ocr_gene$peak %in% target_OCRs, ]
+
+length(target_OCRs)
+```
+
+# Convert OCR-TF matrix to long format
+
+```{r ocr-tf-long}
+df <- as.data.frame(ocr_tf_matrix2)
+df$ID <- rownames(df)
+
+ocr_tf_df <- melt(df, id.vars = "ID")
+ocr_tf_df <- ocr_tf_df[ocr_tf_df$value == 1, ]
+names(ocr_tf_df)[2] <- "TF"
+
+ocr_tf_df$tf_ensembl <- rna_anno$ensembl_gene_id[
+  match(ocr_tf_df$TF, rna_anno$hgnc_symbol)
+]
+
+ocr_tf_df$value <- NULL
+ocr_tf_df <- ocr_tf_df[!is.na(ocr_tf_df$tf_ensembl), ]
+
+head(ocr_tf_df)
+```
+
+# TF-OCR correlation
+
+```{r tf-ocr-correlation}
+common_ids <- intersect(colnames(rna), colnames(atac))
+
+rna2 <- rna[, common_ids]
+atac2 <- atac[, common_ids]
+
+ocr_tf_df$TF_OCR_spearman_pval <- NA_real_
+ocr_tf_df$TF_OCR_spearman_rho <- NA_real_
+
+for (i in seq_len(nrow(ocr_tf_df))) {
+  tf_id <- ocr_tf_df$tf_ensembl[i]
+  ocr_id <- ocr_tf_df$ID[i]
+
+  if (tf_id %in% rownames(rna2) && ocr_id %in% rownames(atac2)) {
+    rr <- cor.test(
+      as.numeric(atac2[ocr_id, ]),
+      as.numeric(rna2[tf_id, ]),
+      method = "spearman"
+    )
+
+    ocr_tf_df$TF_OCR_spearman_pval[i] <- rr$p.value
+    ocr_tf_df$TF_OCR_spearman_rho[i] <- as.numeric(rr$estimate)
+  }
+}
+```
+
+# Merge TF-OCR with OCR-gene links
+
+```{r merge-tf-ocr-gene}
+ocr_tf_gene <- merge(
+  ocr_tf_df,
+  ocr_gene2,
+  by.x = "ID",
+  by.y = "peak"
+)
+
+head(ocr_tf_gene)
+```
+
+# TF-gene correlation
+
+```{r tf-gene-correlation}
+tmp <- unique(data.frame(
+  gene = ocr_tf_gene$gene,
+  tf_ensembl = ocr_tf_gene$tf_ensembl,
+  tf = ocr_tf_gene$TF
+))
+
+tmp$gene_tf_spearman_pval <- NA_real_
+tmp$gene_tf_spearman_rho <- NA_real_
+
+for (i in seq_len(nrow(tmp))) {
+  gene_id <- tmp$gene[i]
+  tf_id <- tmp$tf_ensembl[i]
+
+  if (gene_id %in% rownames(rna) && tf_id %in% rownames(rna)) {
+    rr <- cor.test(
+      as.numeric(rna[gene_id, ]),
+      as.numeric(rna[tf_id, ]),
+      method = "spearman"
+    )
+
+    tmp$gene_tf_spearman_pval[i] <- rr$p.value
+    tmp$gene_tf_spearman_rho[i] <- as.numeric(rr$estimate)
+  }
+}
+
+ocr_tf_gene$gene_tf_pair <- paste0(ocr_tf_gene$TF, "_", ocr_tf_gene$gene)
+tmp$gene_tf_pair <- paste0(tmp$tf, "_", tmp$gene)
+
+ocr_tf_gene <- merge(
+  ocr_tf_gene,
+  tmp,
+  by.x = "gene_tf_pair",
+  by.y = "gene_tf_pair"
+)
+```
+
+# Summary table
+
+```{r summary-table}
+ocr_tf_gene_summary_table <- data.frame(
+  ocr = ocr_tf_gene$ID,
+  gene_ensembl = ocr_tf_gene$gene.x,
+  tf_ensembl = ocr_tf_gene$tf_ensembl.x,
+  ocr_gene_pval = ocr_tf_gene$spearman_pval,
+  ocr_gene_rho = ocr_tf_gene$spearman_rho,
+  ocr_gene_adj.pval = ocr_tf_gene$spearman_adj.pval,
+  ocr_tf_pval = ocr_tf_gene$TF_OCR_spearman_pval,
+  ocr_tf_rho = ocr_tf_gene$TF_OCR_spearman_rho,
+  gene_tf_pval = ocr_tf_gene$gene_tf_spearman_pval,
+  gene_tf_rho = ocr_tf_gene$gene_tf_spearman_rho,
+  gene_symbol = ocr_tf_gene$hgnc_symbol,
+  tf_symbol = ocr_tf_gene$TF,
+  peak_type = ocr_tf_gene$peak_type
+)
+
+head(ocr_tf_gene_summary_table)
+```
+
+# Filter interactions
+
+```{r filter-interactions}
+ocr_tf_gene_summary_table_filtered <- ocr_tf_gene_summary_table[
+  ocr_tf_gene_summary_table$gene_ensembl %in% cluster_rna$gene,
+]
+
+non_da_enhancers <- ocr_tf_gene_summary_table$ocr[
+  ocr_tf_gene_summary_table$peak_type == "enhancer" &
+    !ocr_tf_gene_summary_table$ocr %in% cluster_atac$peak
+]
+
+ocr_tf_gene_summary_table_filtered <- ocr_tf_gene_summary_table_filtered[
+  !ocr_tf_gene_summary_table_filtered$ocr %in% non_da_enhancers,
+]
+```
+
+# Classify interaction likelihood
+
+```{r classify-interactions}
+grn <- ocr_tf_gene_summary_table_filtered
+grn$likelihood <- "yes"
+
+grn$likelihood[
+  grn$likelihood == "yes" &
+    !grn$tf_ensembl %in% cluster_rna$gene
+] <- "no_tf_change"
+
+grn$likelihood[
+  grn$likelihood == "yes" &
+    grn$gene_tf_pval > 0.05
+] <- "no_tf-gene sig corr"
+
+meaningless <- which(
+  grn$likelihood == "yes" &
+    (
+      (grn$gene_tf_rho < 0 & grn$ocr_tf_rho > 0 & grn$ocr_gene_rho > 0) |
+        (grn$gene_tf_rho > 0 & grn$ocr_tf_rho < 0 & grn$ocr_gene_rho < 0) |
+        (grn$gene_tf_rho > 0 & grn$ocr_tf_rho > 0 & grn$ocr_gene_rho < 0) |
+        (grn$gene_tf_rho < 0 & grn$ocr_tf_rho < 0 & grn$ocr_gene_rho < 0) |
+        (grn$gene_tf_rho > 0 & grn$ocr_tf_rho < 0 & grn$ocr_gene_rho > 0)
+    )
+)
+
+grn$likelihood[meaningless] <- "meaningless"
+
+grn$likelihood[
+  grn$likelihood == "yes" &
+    grn$gene_tf_rho < 0
+] <- "repressor"
+
+grn$likelihood[
+  grn$likelihood == "yes" &
+    grn$gene_tf_rho > 0
+] <- "activator"
+
+table(grn$likelihood)
+```
+
+# Save GRN interactions
+
+```{r save-grn}
+tf_ocr_gene_interactions <- grn
+
+tf_ocr_gene_interactions_curated <- grn[
+  grn$likelihood %in% c("activator", "repressor"),
+]
+
+saveRDS(
+  tf_ocr_gene_interactions,
+  file.path("results", "tf_ocr_gene_interactions.rds")
+)
+
+saveRDS(
+  tf_ocr_gene_interactions_curated,
+  file.path("results", "tf_ocr_gene_interactions_curated.rds")
+)
+
+dim(tf_ocr_gene_interactions_curated)
+```

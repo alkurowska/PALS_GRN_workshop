@@ -1,0 +1,100 @@
+---
+title: "06 - Candidate CRE Catalog"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(igraph)
+  library(ggplot2)
+})
+```
+
+
+# Goal
+
+Merge promoter and enhancer OCR-gene links into a candidate CRE catalog.
+
+# Load inputs
+
+```{r load-inputs}
+promoter_ocr_gene_corr <- readRDS(file.path("results", "promoter_ocr_gene_corr.rds"))
+distal_ocr_gene_corr <- readRDS(file.path("results", "distal_ocr_gene_corr.rds"))
+gene_anno <- readRDS(file.path("data", "rna_gene_annotation.rds"))
+```
+
+# Significant enhancer links
+
+```{r significant-enhancers}
+output_enhancer <- distal_ocr_gene_corr[
+  distal_ocr_gene_corr$spearman_adj.pval < 0.05,
+]
+
+output_enhancer$peak_type <- "enhancer"
+
+dim(output_enhancer)
+```
+
+# Promoter links
+
+```{r promoter-links}
+output_promoter <- promoter_ocr_gene_corr
+
+output_promoter2 <- cbind(
+  output_promoter[, c(1:6)],
+  dist = NA,
+  output_promoter[, c(7:8)]
+)
+
+output_promoter2$peak_type <- "Promoter"
+
+head(output_promoter2)
+dim(output_promoter2)
+```
+
+# Merge promoter and enhancer links
+
+```{r merge-links}
+final_output <- rbind(
+  output_promoter2,
+  output_enhancer
+)
+
+table(final_output$peak_type)
+```
+
+# Add gene annotation
+
+```{r add-gene-annotation}
+gene_anno <- gene_anno[
+  gene_anno$ensembl_gene_id %in% final_output$gene,
+]
+
+candidate_CREs <- merge(
+  final_output,
+  gene_anno,
+  by.x = "gene",
+  by.y = "ensembl_gene_id"
+)
+
+head(candidate_CREs)
+```
+
+# Save candidate CREs
+
+```{r save-candidate-cres}
+saveRDS(
+  candidate_CREs,
+  file.path("results", "candidate_CREs.rds")
+)
+
+dim(candidate_CREs)
+```

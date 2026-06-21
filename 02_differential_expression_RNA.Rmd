@@ -1,0 +1,408 @@
+---
+title: "02 - Differential Expression RNA-seq"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(limma)
+  library(ggplot2)
+})
+```
+
+
+# Goal
+
+Identify differentially expressed genes and generate RNA clusters used later in GRN filtering.
+
+# Load RNA data
+
+```{r load-rna}
+rna <- readRDS(file.path("data", "rna_norm_data.rds"))
+rna_metadata <- readRDS(file.path("data", "rna_metadata.rds"))
+rna_anno <- readRDS(file.path("data", "rna_gene_annotation.rds"))
+
+dim(rna)
+head(rna_metadata)
+head(rna_anno)
+```
+
+# Goal
+
+Identify differentially expressed genes across B-cell differentiation transitions using normalized RNA-seq data.`
+
+# Match metadata to RNA matrix
+
+```{r match-metadata}
+# If metadata has sample IDs as rownames, match directly.
+# Otherwise, try to use common sample ID columns.
+
+if (!all(colnames(rna) %in% rownames(rna_metadata))) {
+
+  possible_id_cols <- c("SampleID", "Alias", "sample", "sample_id", "Sample", "ID")
+
+  id_col <- possible_id_cols[
+    possible_id_cols %in% colnames(rna_metadata)
+  ][1]
+
+  if (is.na(id_col)) {
+    stop(
+      "Could not match RNA sample names to metadata. ",
+      "Please set rownames(rna_metadata) to sample IDs or provide a SampleID/Alias column."
+    )
+  }
+
+  rownames(rna_metadata) <- rna_metadata[[id_col]]
+}
+
+rna_metadata <- rna_metadata[
+  match(colnames(rna), rownames(rna_metadata)),
+  ,
+  drop = FALSE
+]
+
+stopifnot(all(rownames(rna_metadata) == colnames(rna)))
+
+head(rna_metadata)
+```
+
+# Define cell type and donor factors
+
+```{r define-factors}
+
+rna_metadata$CellType <- factor(
+  rna_metadata$CellType,
+  levels = c(
+    "HSC",
+    "CLP",
+    "proB",
+    "preB",
+    "ImmatureB",
+    "Transitional_B",
+    "Naive_CD5neg",
+    "Naive_CD5pos"
+  )
+)
+
+table(rna_metadata$CellType)
+```
+
+# Build design matrix
+
+```{r design-matrix}
+# Include donor as covariate if available.
+if ("Donor" %in% colnames(rna_metadata)) {
+
+  rna_metadata$Donor <- factor(rna_metadata$Donor)
+
+  design <- model.matrix(
+    ~ 0 + CellType + Donor,
+    data = rna_metadata
+  )
+
+} else if ("Factor" %in% colnames(rna_metadata)) {
+
+  rna_metadata$Factor <- factor(rna_metadata$Factor)
+
+  design <- model.matrix(
+    ~ 0 + CellType + Factor,
+    data = rna_metadata
+  )
+
+} else {
+
+  design <- model.matrix(
+    ~ 0 + CellType,
+    data = rna_metadata
+  )
+}
+
+colnames(design) <- gsub("CellType", "", colnames(design))
+
+design
+```
+
+# Fit limma model
+
+```{r fit-limma}
+fit <- lmFit(rna, design)
+fit2 <- eBayes(fit)
+
+whole_stats <- topTable(
+  fit2,
+  n = nrow(rna),
+  sort.by = "none"
+)
+
+sum(whole_stats$adj.P.Val < 0.01)
+sum(whole_stats$adj.P.Val < 0.05)
+
+head(whole_stats)
+```
+
+# Define developmental contrasts
+
+```{r contrasts}
+contr.matrix <- makeContrasts(
+  HSC_CLP = HSC - CLP,
+  CLP_ProB = CLP - proB,
+  ProB_PreB = proB - preB,
+  PreB_ImmatureB = preB - ImmatureB,
+  ImmatureB_TransitionalB = ImmatureB - Transitional_B,
+  TransitionalB_NaiveCD5neg = Transitional_B - Naive_CD5neg,
+  TransitionalB_NaiveCD5pos = Transitional_B - Naive_CD5pos,
+  NaiveCD5neg_NaiveCD5pos = Naive_CD5neg - Naive_CD5pos,
+  levels = colnames(design)
+)
+
+contr.matrix
+```
+
+# Differential expression across transitions
+
+```{r fit-contrasts}
+fit.contrasts <- contrasts.fit(
+  fit,
+  contr.matrix
+)
+
+fit.contrasts2 <- eBayes(
+  fit.contrasts
+)
+
+contrast_stats <- topTable(
+  fit.contrasts2,
+  number = nrow(rna),
+  sort.by = "none"
+)
+
+sum(contrast_stats$adj.P.Val < 0.01)
+sum(contrast_stats$adj.P.Val < 0.05)
+
+head(contrast_stats)
+```
+
+# Build transition matrices
+
+This reproduces the binary transition-level output of the original RNA differential expression script.
+
+- `1` = upregulated
+- `-1` = downregulated
+- `0` = not significant
+
+Thresholds:
+
+```text
+adjusted p-value < 0.05
+absolute logFC > 0.58
+```
+
+The logFC threshold corresponds approximately to fold-change > 1.5.
+
+```{r transition-matrices}
+all_padj <- matrix(
+  ncol = ncol(contr.matrix),
+  nrow = nrow(rna)
+)
+
+all_fch <- matrix(
+  ncol = ncol(contr.matrix),
+  nrow = nrow(rna)
+)
+
+sig <- matrix(
+  0,
+  ncol = ncol(contr.matrix),
+  nrow = nrow(rna)
+)
+
+for (i in seq_len(ncol(contr.matrix))) {
+
+  target_stats <- topTable(
+    fit.contrasts2,
+    coef = i,
+    number = nrow(rna),
+    sort.by = "none"
+  )
+
+  all_padj[, i] <- target_stats$adj.P.Val
+  all_fch[, i] <- target_stats$logFC
+
+  sel_pos <- intersect(
+    which(all_padj[, i] < 0.05),
+    which(all_fch[, i] > 0.58)
+  )
+
+  sig[sel_pos, i] <- 1
+
+  sel_neg <- intersect(
+    which(all_padj[, i] < 0.05),
+    which(all_fch[, i] < -0.58)
+  )
+
+  sig[sel_neg, i] <- -1
+}
+
+colnames(all_padj) <- paste0(
+  "p.adj_",
+  colnames(contr.matrix)
+)
+
+colnames(all_fch) <- paste0(
+  "logFC_",
+  colnames(contr.matrix)
+)
+
+colnames(sig) <- paste0(
+  "sig_",
+  colnames(contr.matrix)
+)
+
+rownames(all_padj) <- rownames(rna)
+rownames(all_fch) <- rownames(rna)
+rownames(sig) <- rownames(rna)
+
+dea_results <- data.frame(
+  sig,
+  all_padj,
+  all_fch
+)
+
+head(dea_results)
+```
+
+# Save full DE results
+
+```{r save-de-results}
+write.table(
+  dea_results,
+  file.path(
+    results_dir,
+    "dea_results.txt"
+  ),
+  sep = "\t",
+  dec = ".",
+  quote = FALSE
+)
+
+saveRDS(
+  dea_results,
+  file.path(
+    results_dir,
+    "rna_differential_expression_all_transitions.rds"
+  )
+)
+```
+
+# Significant DE genes
+
+```{r significant-de-genes}
+is_de <- apply(
+  sig,
+  1,
+  function(x) sum(x != 0)
+) > 0
+
+dea_sig <- sig[
+  is_de,
+  ,
+  drop = FALSE
+]
+
+dim(dea_sig)
+
+write.table(
+  dea_sig,
+  file.path(
+    results_dir,
+    "dea_significant_binary.txt"
+  ),
+  sep = "\t",
+  dec = ".",
+  quote = FALSE
+)
+```
+
+# Create cluster_rna object for GRN analysis
+
+The downstream GRN workflow uses:
+
+```text
+cluster_rna$gene
+```
+
+to keep TFs and target genes that are differentially expressed across B-cell differentiation.
+
+```{r create-cluster-rna}
+cluster_rna <- as.data.frame(
+  dea_sig
+)
+
+cluster_rna$gene <- rownames(cluster_rna)
+
+saveRDS(
+  cluster_rna,
+  file.path(
+    results_dir,
+    "rna_deg_clustering.rds"
+  )
+)
+
+head(cluster_rna)
+```
+
+# Quick visualization
+
+```{r plot-de-summary}
+de_summary <- data.frame(
+  contrast = colnames(sig),
+  n_up = colSums(sig == 1),
+  n_down = colSums(sig == -1)
+)
+
+de_summary_long <- de_summary |>
+  pivot_longer(
+    cols = c(n_up, n_down),
+    names_to = "direction",
+    values_to = "n_genes"
+  )
+
+ggplot(
+  de_summary_long,
+  aes(
+    x = contrast,
+    y = n_genes,
+    fill = direction
+  )
+) +
+  geom_col(position = "dodge") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  ) +
+  labs(
+    x = "Transition",
+    y = "Number of DE genes",
+    fill = "Direction"
+  )
+```
+
+# Output files
+
+This chapter creates:
+
+```text
+results/dea_results.txt
+results/dea_significant_binary.txt
+results/rna_differential_expression_all_transitions.rds
+results/rna_deg_clustering.rds
+```
+

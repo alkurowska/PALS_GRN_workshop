@@ -1,0 +1,204 @@
+---
+title: "05 - Enhancer OCR-Gene Correlations"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(igraph)
+  library(ggplot2)
+})
+```
+
+
+# Goal
+
+Link distal and intronic OCRs to genes using ±1 Mb TSS windows.
+
+# Load input data
+
+```{r load-inputs}
+
+atac <- readRDS(file.path("data", "atac_norm_data.rds"))
+atac_metadata <- readRDS(file.path("data", "atac_metadata.rds"))
+
+rna <- readRDS(file.path("data", "rna_norm_data.rds"))
+rna_metadata <- readRDS(file.path("data", "rna_metadata.rds"))
+
+ids_atac_rna <- readRDS(file.path("data", "rna_atac_paired_samples.rds"))
+
+gene_anno <- readRDS(file.path("data", "rna_gene_annotation.rds"))
+
+if (file.exists(file.path("data", "atac_OCR_annotation_extended_histone.rds"))) {
+  ocr_anno <- readRDS(file.path("data", "atac_OCR_annotation_extended_histone.rds"))
+} else {
+  ocr_anno <- readRDS(file.path("data", "atac_OCR_annotation.rds"))
+}
+```
+
+# Prepare paired matrices
+
+```{r paired-matrices}
+rna_common <- as.matrix(rna[, ids_atac_rna])
+atac_common <- as.matrix(atac[, ids_atac_rna])
+
+gene_anno <- gene_anno[rownames(rna), ]
+ocr_anno <- ocr_anno[rownames(atac_common), ]
+```
+
+# Select candidate enhancer OCRs
+
+```{r enhancer-ocrs}
+ocr_anno <- ocr_anno[
+  ocr_anno$annotation_simplified %in% c("Distal Intergenic", "Intron"),
+]
+
+atac_enhancer <- atac_common[rownames(ocr_anno), ]
+
+nrow(ocr_anno)
+```
+
+# Parse OCR coordinates
+
+```{r parse-coordinates}
+atac_position <- strsplit(rownames(atac_enhancer), "_")
+
+atac_ini <- as.numeric(unlist(lapply(atac_position, function(x) x[2])))
+names(atac_ini) <- rownames(atac_enhancer)
+
+atac_fin <- as.numeric(unlist(lapply(atac_position, function(x) x[3])))
+names(atac_fin) <- rownames(atac_enhancer)
+
+atac_chr <- gsub(
+  "chr",
+  "",
+  unlist(lapply(atac_position, function(x) x[1]))
+)
+names(atac_chr) <- rownames(atac_enhancer)
+```
+
+# Define TSS and ±1 Mb window
+
+```{r tss-window}
+gene_anno$TSS <- NA_real_
+
+for (i in seq_len(nrow(gene_anno))) {
+  if (gene_anno$strand[i] == -1) {
+    gene_anno$TSS[i] <- gene_anno$end_position[i]
+  }
+
+  if (gene_anno$strand[i] == 1) {
+    gene_anno$TSS[i] <- gene_anno$start_position[i]
+  }
+}
+
+window_up <- gene_anno$TSS - 1000000
+window_dw <- gene_anno$TSS + 1000000
+```
+
+# Correlate enhancer OCR accessibility with gene expression
+
+```{r enhancer-correlations}
+peak_gene_association_intergenic <- list()
+
+for (i in seq_len(nrow(rna_common))) {
+  sel <- which(
+    atac_chr == gene_anno$chromosome_name[i] &
+      atac_ini >= window_up[i] &
+      atac_fin <= window_dw[i]
+  )
+
+  sel_id <- names(sel)
+
+  if (length(sel) != 0) {
+    cor_output <- lapply(sel_id, function(peak_id) {
+      cc <- cor.test(rna_common[i, ], atac_enhancer[peak_id, ])
+      cc2 <- cor.test(rna_common[i, ], atac_enhancer[peak_id, ], method = "spearman")
+
+      mean_peak <- atac_ini[peak_id] +
+        ((atac_fin[peak_id] - atac_ini[peak_id]) / 2)
+
+      if (gene_anno$strand[i] == -1) {
+        cor_dist <- mean_peak - gene_anno$TSS[i]
+      } else {
+        cor_dist <- gene_anno$TSS[i] - mean_peak
+      }
+
+      data.frame(
+        peak = peak_id,
+        pearson_pval = cc$p.value,
+        pearson_rho = as.numeric(cc$estimate),
+        spearman_pval = cc2$p.value,
+        spearman_rho = as.numeric(cc2$estimate),
+        dist = cor_dist
+      )
+    }) |>
+      bind_rows()
+  } else {
+    cor_output <- NA
+  }
+
+  peak_gene_association_intergenic[[i]] <- cor_output
+}
+
+names(peak_gene_association_intergenic) <- gene_anno$ensembl_gene_id
+```
+
+# Bonferroni correction
+
+```{r enhancer-adjustment}
+n_contrasts_intergenic <- unlist(lapply(
+  peak_gene_association_intergenic,
+  function(x) {
+    if (is.data.frame(x)) return(nrow(x))
+    if (is.na(x)) return(0)
+  }
+))
+
+adj_peak_gene_association_intergenic <- lapply(
+  peak_gene_association_intergenic,
+  function(x) {
+    if (is.data.frame(x)) {
+      x$pearson_adj.pval <- p.adjust(
+        x$pearson_pval,
+        method = "bonferroni",
+        n = sum(n_contrasts_intergenic)
+      )
+
+      x$spearman_adj.pval <- p.adjust(
+        x$spearman_pval,
+        method = "bonferroni",
+        n = sum(n_contrasts_intergenic)
+      )
+    }
+
+    x
+  }
+)
+```
+
+# Save enhancer OCR-gene links
+
+```{r save-enhancer-links}
+distal_ocr_gene_corr <- bind_rows(
+  adj_peak_gene_association_intergenic[
+    unlist(lapply(adj_peak_gene_association_intergenic, is.data.frame))
+  ],
+  .id = "gene"
+)
+
+saveRDS(
+  distal_ocr_gene_corr,
+  file.path("results", "distal_ocr_gene_corr.rds")
+)
+
+head(distal_ocr_gene_corr)
+```

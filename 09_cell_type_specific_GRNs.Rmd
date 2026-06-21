@@ -1,0 +1,111 @@
+---
+title: "09 - Cell-Type-Specific GRNs"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(reshape2)
+  library(igraph)
+  library(ggplot2)
+})
+```
+
+
+# Goal
+
+Generate cell-type-specific GRNs.
+
+# Load inputs
+
+```{r load-inputs}
+rna <- readRDS(file.path("data", "rna_norm.rds"))
+rna_metadata <- readRDS(file.path("data", "rna_metadata.rds"))
+rna_anno <- readRDS(file.path("data", "rna_gene_annotation.rds"))
+
+atac <- readRDS(file.path("data", "atac_norm.rds"))
+atac_metadata <- readRDS(file.path("data", "atac_metadata.rds"))
+
+tf_ocr_gene <- readRDS(file.path("results", "tf_ocr_gene_interactions_curated.rds"))
+```
+
+# Median RNA and ATAC per cell type
+
+```{r median-signals}
+median_atac_per_group <- t(apply(
+  atac,
+  1,
+  function(x) by(x, atac_metadata$CellType, median)
+))
+
+median_rna_per_group <- t(apply(
+  rna,
+  1,
+  function(x) by(x, rna_metadata$CellType, median)
+))
+```
+
+# Extend TF-OCR-gene table
+
+```{r extend-table}
+tmp1 <- median_atac_per_group[tf_ocr_gene$ocr, , drop = FALSE]
+colnames(tmp1) <- paste0("atac_", colnames(tmp1))
+
+tmp2 <- median_rna_per_group[tf_ocr_gene$tf_ensembl, , drop = FALSE]
+colnames(tmp2) <- paste0("tf_", colnames(tmp2))
+
+tmp3 <- median_rna_per_group[tf_ocr_gene$gene_ensembl, , drop = FALSE]
+colnames(tmp3) <- paste0("gene_", colnames(tmp3))
+
+tf_ocr_gene_extended <- cbind(
+  tf_ocr_gene,
+  tmp1,
+  tmp2,
+  tmp3
+)
+```
+
+# Determine interaction availability
+
+```{r interaction-availability}
+cell_type <- c(
+  "HSC",
+  "CLP",
+  "proB",
+  "preB",
+  "ImmatureB",
+  "Transitional_B",
+  "Naive_CD5neg",
+  "Naive_CD5pos"
+)
+
+for (ct in cell_type) {
+  atac_col <- paste0("atac_", ct)
+  interaction_col <- paste0(ct, "_interaction")
+
+  tf_ocr_gene_extended[[interaction_col]] <- "yes"
+  tf_ocr_gene_extended[[interaction_col]][
+    tf_ocr_gene_extended[[atac_col]] < 1
+  ] <- "no"
+}
+
+tf_ocr_gene_extended |>
+  select(ends_with("_interaction")) |>
+  summarise(across(everything(), function(x) sum(x == "yes")))
+```
+
+# Save extended interactions
+
+```{r save-extended}
+saveRDS(
+  tf_ocr_gene_extended,
+  file.path("results", "tf_ocr_gene_interactions_curated_extended.rds")
+)
+```
